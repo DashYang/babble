@@ -191,6 +191,10 @@ func (c *Core) GetLatestFrame() (hg.Frame, error) {
 	return c.hg.GetLatestFrame()
 }
 
+func (c *Core) GetLatestBlockWithFrame() (hg.Block, hg.Frame, error) {
+	return c.hg.GetLatestBlockWithFrame()
+}
+
 //returns events that c knowns about and are not in 'known'
 func (c *Core) EventDiff(known map[int]int) (events []hg.Event, err error) {
 	unknown := []hg.Event{}
@@ -260,6 +264,31 @@ func (c *Core) Sync(unknownEvents []hg.WireEvent) error {
 		c.transactionPool = [][]byte{}
 		c.blockSignaturePool = []hg.BlockSignature{}
 	}
+
+	return nil
+}
+
+func (c *Core) FastForward(block hg.Block, frame hg.Frame) error {
+
+	//XXX TODO Check Block and Frame
+
+	err := c.hg.Reset(block, frame)
+	if err != nil {
+		return err
+	}
+
+	err = c.RunConsensus()
+	if err != nil {
+		return err
+	}
+
+	//XXX is there a way to make this nicer?
+	c.Head, _, _ = c.hg.Store.LastEventFrom(c.HexID())
+	c.Seq = c.KnownEvents()[c.id]
+	c.logger.WithFields(logrus.Fields{
+		"head": c.Head,
+		"seq":  c.Seq,
+	}).Debug("FastForward HEAD and SEQ")
 
 	return nil
 }

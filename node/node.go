@@ -107,6 +107,7 @@ func (n *Node) RunAsync(gossip bool) {
 }
 
 func (n *Node) Run(gossip bool) {
+
 	//The ControlTimer allows the background routines to control the
 	//heartbeat timer when the node is in the Babbling state. The timer should
 	//only be running when there are uncommitted transactions in the system.
@@ -114,7 +115,7 @@ func (n *Node) Run(gossip bool) {
 
 	//Execute some background work regardless of the state of the node.
 	//Process RPC requests as well as SumbitTx and CommitBlock requests
-	n.goFunc(n.doBackgroundWork)
+	go n.doBackgroundWork()
 
 	//Execute Node State Machine
 	for {
@@ -137,11 +138,13 @@ func (n *Node) doBackgroundWork() {
 	for {
 		select {
 		case rpc := <-n.netCh:
-			n.logger.Debug("Processing RPC")
-			n.processRPC(rpc)
-			if n.core.NeedGossip() && !n.controlTimer.set {
-				n.controlTimer.resetCh <- struct{}{}
-			}
+			n.goFunc(func() {
+				n.logger.Debug("Processing RPC")
+				n.processRPC(rpc)
+				if n.core.NeedGossip() && !n.controlTimer.set {
+					n.controlTimer.resetCh <- struct{}{}
+				}
+			})
 		case t := <-n.submitCh:
 			n.logger.Debug("Adding Transaction")
 			n.addTransaction(t)
@@ -210,6 +213,8 @@ func (n *Node) processRPC(rpc net.RPC) {
 		n.processSyncRequest(rpc, cmd)
 	case *net.EagerSyncRequest:
 		n.processEagerSyncRequest(rpc, cmd)
+	case *net.FastForwardRequest:
+		n.processFastForwardRequest(rpc, cmd)
 	default:
 		n.logger.WithField("cmd", rpc.Command).Error("Unexpected RPC command")
 		rpc.Respond(nil, fmt.Errorf("unexpected command"))
@@ -294,6 +299,32 @@ func (n *Node) processEagerSyncRequest(rpc net.RPC, cmd *net.EagerSyncRequest) {
 		Success: success,
 	}
 	rpc.Respond(resp, err)
+}
+
+func (n *Node) processFastForwardRequest(rpc net.RPC, cmd *net.FastForwardRequest) {
+	n.logger.WithFields(logrus.Fields{
+		"from": cmd.FromID,
+	}).Debug("process FastForwardRequest")
+
+	resp := &net.FastForwardResponse{
+		FromID: n.id,
+	}
+	var respErr error
+
+	//Get latest Frame
+	block, frame, err := n.core.GetLatestBlockWithFrame()
+	if err != nil {
+		n.logger.WithField("error", err).Error("Getting Frame")
+		respErr = err
+	}
+	resp.Block = block
+	resp.Frame = frame
+
+	n.logger.WithFields(logrus.Fields{
+		"Events": len(resp.Frame.Events),
+		"Error":  respErr,
+	}).Debug("Responding to FastForwardRequest")
+	rpc.Respond(resp, respErr)
 }
 
 func (n *Node) preGossip() (bool, error) {
@@ -436,9 +467,33 @@ func (n *Node) push(peerAddr string, knownEvents map[int]int) error {
 
 func (n *Node) fastForward() error {
 	n.logger.Debug("IN CATCHING-UP STATE")
-	n.logger.Debug("fast-sync not implemented yet")
 
-	//XXX Work in Progress on fsync branch
+	//wait until sync routines finish
+	n.waitRoutines()
+
+	//fastForwardRequest
+	peer := n.peerSelector.Next()
+	start := time.Now()
+	resp, err := n.requestFastForward(peer.NetAddr)
+	elapsed := time.Since(start)
+	n.logger.WithField("duration", elapsed.Nanoseconds()).Debug("requestFastForward()")
+	if err != nil {
+		n.logger.WithField("error", err).Error("requestFastForward()")
+		return err
+	}
+	n.logger.WithField("events", len(resp.Frame.Events)).Debug("FastForwardResponse")
+
+	//prepare core. ie: fresh hashgraph
+	n.coreLock.Lock()
+	err = n.core.FastForward(resp.Block, resp.Frame)
+	n.coreLock.Unlock()
+
+	if err != nil {
+		n.logger.WithField("error", err).Error("Fast Forwarding Hashgraph")
+		return err
+	}
+
+	n.logger.Debug("Fast-Forward OK")
 
 	n.setState(Babbling)
 
@@ -466,6 +521,21 @@ func (n *Node) requestEagerSync(target string, events []hg.WireEvent) (net.Eager
 
 	var out net.EagerSyncResponse
 	err := n.trans.EagerSync(target, &args, &out)
+
+	return out, err
+}
+
+func (n *Node) requestFastForward(target string) (net.FastForwardResponse, error) {
+	n.logger.WithFields(logrus.Fields{
+		"target": target,
+	}).Debug("RequestFastForward()")
+
+	args := net.FastForwardRequest{
+		FromID: n.id,
+	}
+
+	var out net.FastForwardResponse
+	err := n.trans.FastForward(target, &args, &out)
 
 	return out, err
 }
